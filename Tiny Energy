@@ -1,0 +1,223 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
+
+# ======================
+# Network definitions
+# ======================
+
+class TinyNet(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, output_dim),
+            nn.ReLU(),
+            nn.Linear(output_dim, output_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class EnergyHead(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.head = nn.Linear(dim, 1)
+
+    def forward(self, feats):
+        return self.head(feats).squeeze(-1)
+
+
+class OutputHead(nn.Module):
+    def __init__(self, dim, out_dim):
+        super().__init__()
+        self.linear = nn.Linear(dim, out_dim)
+
+    def forward(self, y):
+        return self.linear(y)
+
+
+class QHead(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.linear = nn.Linear(dim, 1)
+
+    def forward(self, y):
+        return torch.sigmoid(self.linear(y))
+
+
+# ======================
+# Energy Function
+# ======================
+
+def energy_fn(x, y, z, net, energy_head, lambda_consistency=0.1):
+    """Compute scalar energy per sample."""
+    input_concat = torch.cat([x, y, z], dim=-1)
+    feats = net(input_concat)
+    recon = F.mse_loss(feats, z, reduction='none').mean(dim=-1)  # [B]
+    energy = energy_head(feats)
+    # optional normalization for stability
+    scale = energy.abs().mean().detach().clamp(min=1e-6)
+    energy = (energy / scale) + lambda_consistency * recon
+    return energy  # [B]
+
+
+# ======================
+# Recursive Inference
+# ======================
+
+def latent_refine(x, y, z, net, energy_head, n_steps=6, eta=0.1, noise_std=0.0):
+    """Gradient-based refinement of z and y via energy minimization."""
+    for _ in range(n_steps):
+        z = z.clone().requires_grad_(True)
+        e = energy_fn(x, y, z, net, energy_head)
+        grad_z, = torch.autograd.grad(e.mean(), z, retain_graph=False)
+        z = z - eta * grad_z
+        if noise_std > 0:
+            z = z + noise_std * torch.randn_like(z)
+        z = z.detach()
+
+    y = y.clone().requires_grad_(True)
+    e = energy_fn(x, y, z, net, energy_head)
+    grad_y, = torch.autograd.grad(e.mean(), y, retain_graph=False)
+    y = y - eta * grad_y
+    if noise_std > 0:
+        y = y + noise_std * torch.randn_like(y)
+    y = y.detach()
+    return y, z
+
+
+def deep_recursion_ebm(x, y, z, net, energy_head, output_head, q_head,
+                       n_inner=6, T=3, eta=0.1):
+    """Multi-step recursion like TRM with last supervised step."""
+    with torch.no_grad():
+        for _ in range(T - 1):
+            y, z = latent_refine(x, y, z, net, energy_head,
+                                 n_steps=n_inner, eta=eta)
+    y, z = latent_refine(x, y, z, net, energy_head,
+                         n_steps=n_inner, eta=eta)
+    y_out = output_head(y)
+    q_out = q_head(y)
+    return (y.detach(), z.detach()), y_out, q_out
+
+
+# ======================
+# Persistent Negative Buffer
+# ======================
+
+class NegativeBuffer:
+    """Holds previous (x, y, z) for persistent CD sampling."""
+    def __init__(self, capacity=1024):
+        self.capacity = capacity
+        self.buffer = []
+
+    def update(self, x, y, z):
+        if len(self.buffer) >= self.capacity:
+            self.buffer.pop(0)
+        self.buffer.append((x.detach().cpu(), y.detach().cpu(), z.detach().cpu()))
+
+    def sample(self, batch_size, device):
+        if len(self.buffer) == 0:
+            return None
+        idxs = torch.randint(0, len(self.buffer), (batch_size,))
+        xs, ys, zs = zip(*[self.buffer[i] for i in idxs])
+        return (torch.stack(xs).to(device),
+                torch.stack(ys).to(device),
+                torch.stack(zs).to(device))
+
+
+# ======================
+# Training Loop
+# ======================
+
+def train_epoch(train_loader, net, energy_head, output_head, q_head,
+                optimizer, buffer, device='cpu',
+                alpha=0.5, lambda_consistency=0.1, energy_threshold=-0.5):
+
+    net.train(); energy_head.train(); output_head.train(); q_head.train()
+    total_loss = 0.0
+
+    for x_in, y_true in train_loader:
+        x_in, y_true = x_in.to(device), y_true.to(device)
+        batch_size, dim = x_in.shape
+
+        # Initialize latent & output embeddings
+        y = torch.randn(batch_size, dim, device=device)
+        z = torch.randn(batch_size, dim, device=device)
+
+        (y, z), y_hat, q_hat = deep_recursion_ebm(
+            x_in, y, z, net, energy_head, output_head, q_head,
+            n_inner=6, T=3
+        )
+
+        # Energy computation
+        e_pos = energy_fn(x_in, y_hat, z, net, energy_head, lambda_consistency)
+
+        # Sample negatives (persistent CD or random fallback)
+        negs = buffer.sample(batch_size, device)
+        if negs is None:
+            y_neg = y_hat[torch.randperm(batch_size)]
+            z_neg = z[torch.randperm(batch_size)]
+            x_neg = x_in
+        else:
+            x_neg, y_neg, z_neg = negs
+
+        e_neg = energy_fn(x_neg, y_neg, z_neg, net, energy_head, lambda_consistency)
+
+        # Contrastive (softplus) energy loss
+        loss_ebm = F.softplus(e_pos - e_neg).mean()
+
+        # Halting / energy-based stop supervision
+        halt_target = (e_pos.detach() < energy_threshold).float().unsqueeze(-1)
+        loss_halt = F.binary_cross_entropy(q_hat, halt_target)
+
+        # Supervised term (if labels available)
+        loss_ce = F.cross_entropy(y_hat, y_true.long())
+
+        # Total loss
+        loss = loss_ce + alpha * (loss_ebm + loss_halt)
+        total_loss += loss.item()
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # Update negative buffer
+        buffer.update(x_in, y_hat, z)
+
+    return total_loss / len(train_loader)
+
+
+# ======================
+# Main / Example Setup
+# ======================
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    dim = 128  # use small (2 or 8) for debugging
+
+    net = TinyNet(input_dim=dim * 3, output_dim=dim).to(device)
+    energy_head = EnergyHead(dim).to(device)
+    output_head = OutputHead(dim, out_dim=10).to(device)
+    q_head = QHead(dim).to(device)
+
+    optimizer = Adam([*net.parameters(),
+                      *energy_head.parameters(),
+                      *output_head.parameters(),
+                      *q_head.parameters()],
+                     lr=1e-4)
+
+    buffer = NegativeBuffer(capacity=512)
+
+    # Dummy data for quick test
+    x_dummy = torch.randn(64, dim).to(device)
+    y_dummy = torch.randint(0, 10, (64,)).to(device)
+    train_loader = [(x_dummy.clone(), y_dummy.clone()) for _ in range(10)]
+
+    print(f"Training on {device} | dim={dim}")
+    for epoch in range(3):
+        loss = train_epoch(train_loader, net, energy_head, output_head, q_head,
+                           optimizer, buffer, device=device)
+        print(f"Epoch {epoch:02d} | Avg Loss = {loss:.4f}")
